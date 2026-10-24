@@ -24,6 +24,9 @@
 
 mod buffer;
 mod members;
+mod reactions;
+
+use reactions::{parse_reaction_input, ReactionChange, ReactionInput, Reactions};
 mod verification;
 
 use buffer::{print_rendered_event_to_buffer, RoomBuffer, SpaceChildSelection};
@@ -64,7 +67,8 @@ use matrix_sdk::{
     ruma::{
         api::{client::threads::get_threads::v1::IncludeThreads, Direction},
         events::{
-            relation::{RelationType, Thread},
+            reaction::ReactionEventContent,
+            relation::{Annotation, RelationType, Thread},
             room::{
                 encrypted::{
                     EncryptedEventScheme, Relation as EncryptedRelation,
@@ -351,6 +355,7 @@ pub struct MatrixRoom {
     latest_read_event_id: Rc<RefCell<Option<OwnedEventId>>>,
     latest_thread_event_ids: Rc<RefCell<HashMap<OwnedEventId, OwnedEventId>>>,
     typing_users: Rc<RefCell<Vec<String>>>,
+    reactions: Rc<RefCell<Reactions>>,
     pending_encrypted_events:
         Rc<RefCell<HashMap<OwnedEventId, PendingEncryptedEvent>>>,
     pending_encrypted_recoveries:
@@ -780,6 +785,7 @@ impl RoomHandle {
             latest_read_event_id: Rc::new(RefCell::new(None)),
             latest_thread_event_ids: Rc::new(RefCell::new(HashMap::new())),
             typing_users: Rc::new(RefCell::new(Vec::new())),
+            reactions: Rc::new(RefCell::new(Reactions::default())),
             pending_encrypted_events: Rc::new(RefCell::new(HashMap::new())),
             pending_encrypted_recoveries: Rc::new(RefCell::new(HashSet::new())),
             thread_history_in_flight: Rc::new(RefCell::new(HashSet::new())),
@@ -1027,10 +1033,47 @@ impl BufferInputCallbackAsync for MatrixRoom {
         }
 
         if let Ok(buffer) = buffer.upgrade() {
+            if let Some(reaction) = parse_reaction_input(&input) {
+                self.send_reaction_input(&buffer, reaction).await;
+                return;
+            }
+
             let content = self.text_message_content(&buffer, input);
             self.send_message(content).await;
         }
     }
+}
+
+/// The `index`th most recent event in `buffer` (1 = latest), counting each
+/// multi-line message once and skipping redacted ones.
+fn nth_recent_event(buffer: &Buffer, index: usize) -> Option<OwnedEventId> {
+    let mut last: Option<OwnedEventId> = None;
+    let mut count = 0;
+
+    for line in buffer.lines().rev() {
+        let tags = line.tags();
+        if tags.iter().any(|tag| tag.as_ref() == "matrix_redacted") {
+            continue;
+        }
+        let Some(event_id) = tags
+            .iter()
+            .find_map(|tag| tag.as_ref().strip_prefix("matrix_id_"))
+            .and_then(|id| EventId::parse(id).ok())
+        else {
+            continue;
+        };
+        if last.as_ref() == Some(&event_id) {
+            continue;
+        }
+
+        count += 1;
+        if count == index {
+            return Some(event_id);
+        }
+        last = Some(event_id);
+    }
+
+    None
 }
 
 impl MatrixRoom {
@@ -1527,6 +1570,87 @@ impl MatrixRoom {
         Weechat::spawn(async move { verification.cancel().await }).detach();
     }
 
+    fn add_reaction(
+        &self,
+        reaction_id: &EventId,
+        sender: &UserId,
+        annotation: &Annotation,
+    ) {
+        let added = self.reactions.borrow_mut().add(
+            reaction_id.to_owned(),
+            annotation.event_id.clone(),
+            annotation.key.clone(),
+            sender.to_owned(),
+        );
+        if added {
+            self.refresh_reactions(&annotation.event_id);
+        }
+    }
+
+    /// Re-attach the reaction suffix after `target` was (re)printed.
+    fn reactions_printed(&self, target: &EventId) {
+        self.reactions.borrow_mut().forget_rendered(target);
+        self.refresh_reactions(target);
+    }
+
+    /// Update the reaction suffix shown after `target`.
+    fn refresh_reactions(&self, target: &EventId) {
+        let (old, new) = {
+            let reactions = self.reactions.borrow();
+            (
+                reactions.rendered(target),
+                reactions.suffix(
+                    target,
+                    &self.own_user_id,
+                    Weechat::color("darkgray"),
+                    Weechat::color("blue"),
+                ),
+            )
+        };
+
+        if old != new && self.buffer.set_event_suffix(target, &old, &new) {
+            self.reactions.borrow_mut().set_rendered(target, new);
+        }
+    }
+
+    async fn send_reaction_input(&self, buffer: &Buffer<'_>, input: ReactionInput) {
+        let Some(target) = nth_recent_event(buffer, input.index) else {
+            self.print_error(&format!("No message at index {}", input.index));
+            return;
+        };
+        let own =
+            self.reactions
+                .borrow()
+                .own_reaction(&target, &input.key, &self.own_user_id);
+
+        match input.change {
+            ReactionChange::Add => {
+                if own.is_some() {
+                    return;
+                }
+                let Some(connection) = self.connection.borrow().clone() else {
+                    self.print_error("Not connected. Please connect first.");
+                    return;
+                };
+                let content = AnyMessageLikeEventContent::Reaction(
+                    ReactionEventContent::new(Annotation::new(target, input.key)),
+                );
+                if let Err(error) =
+                    connection.send_message(self.room(), content, None).await
+                {
+                    self.print_error(&format!("Failed to send reaction: {error}"));
+                }
+            }
+            ReactionChange::Remove => match own {
+                Some(reaction_id) => self.send_redaction(reaction_id, None).await,
+                None => self.print_error(&format!(
+                    "No {} reaction of yours on that message",
+                    input.key
+                )),
+            },
+        }
+    }
+
     async fn redact_event(&self, event: &SyncRoomRedactionEvent) {
         let event = if let SyncRoomRedactionEvent::Original(e) = event {
             e
@@ -1535,6 +1659,21 @@ impl MatrixRoom {
             // nothing to do here.
             return;
         };
+
+        // A redacted reaction only changes the annotated message's suffix.
+        if let Some(target) = event
+            .redacts
+            .as_deref()
+            .and_then(|redacts| self.reactions.borrow_mut().remove(redacts))
+        {
+            self.refresh_reactions(&target);
+            return;
+        }
+
+        // The redaction rewrites the message, including any reaction suffix.
+        if let Some(redacts) = event.redacts.as_deref() {
+            self.reactions.borrow_mut().forget_rendered(redacts);
+        }
 
         // TODO: remove this unwrap.
         let redacter = self.members.get(&event.sender).await.unwrap();
@@ -3437,6 +3576,7 @@ impl MatrixRoom {
                 })
             {
                 self.buffer.replace_edit(event_id, event.sender(), rendered);
+                self.reactions_printed(event_id);
             }
         }
     }
@@ -3447,6 +3587,18 @@ impl MatrixRoom {
         // may have been printed out as a local echo.
         self.members
             .mark_active(event.sender(), event.origin_server_ts());
+
+        if let AnySyncMessageLikeEvent::Reaction(SyncMessageLikeEvent::Original(
+            reaction,
+        )) = event
+        {
+            self.add_reaction(
+                &reaction.event_id,
+                &reaction.sender,
+                &reaction.content.relates_to,
+            );
+            return;
+        }
 
         // Keep encrypted events available for a later decryption retry even
         // when WeeChat restored their placeholder lines from its log already.
@@ -3515,6 +3667,7 @@ impl MatrixRoom {
                     thread_root.as_deref(),
                     rendered,
                 );
+                self.reactions_printed(event.event_id());
             }
         }
     }
@@ -3651,6 +3804,15 @@ impl MatrixRoom {
                 };
                 let send_time = event.origin_server_ts();
 
+                if let AnyMessageLikeEventContent::Reaction(reaction) = &content {
+                    self.add_reaction(
+                        event.event_id(),
+                        event.sender(),
+                        &reaction.relates_to,
+                    );
+                    return 0;
+                }
+
                 // History can contain an event whose placeholder was restored
                 // from a WeeChat log. Record it before render de-duplication so
                 // a later room key can still replace the existing line.
@@ -3697,6 +3859,7 @@ impl MatrixRoom {
                             thread_root.as_deref(),
                             rendered.add_backlog_tags(),
                         );
+                        self.reactions_printed(event.event_id());
                         return line_count;
                     }
                 }
