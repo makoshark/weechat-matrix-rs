@@ -238,6 +238,26 @@ arrived while WeeChat was running. On startup and on every sync, a room with
 unread messages (or marked as unread in another client) is added to the hotlist
 at the message, private, or highlight level, and a room read elsewhere is
 removed from it. The buffer currently displayed is left alone.
+# Reactions
+
+Reactions are shown after the message they belong to, with a count per
+emoji; reactions you added are highlighted:
+
+       <alice> lunch at noon? [👍2 😄1]
+
+To react, send `+` followed by an emoji or a `:shortcode:`. A number in front
+picks the nth most recent message instead of the latest; `-` removes your
+reaction:
+
+       +👍
+       +:thumbsup:
+       3+:smile:
+       -:thumbsup:
+
+To complete shortcodes with Tab, add the `matrix_emojis` completion to the
+default template:
+
+       /set weechat.completion.default_template "%(nicks)|%(irc_channels)|%(matrix_emojis)"
 
 # Matrix Spaces
 
