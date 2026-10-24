@@ -138,6 +138,12 @@ pub enum ClientMessage {
         is_direct: bool,
         display_name: Option<String>,
     },
+    RoomUnread {
+        room_id: OwnedRoomId,
+        unread: u64,
+        mentions: u64,
+        marked_unread: bool,
+    },
 }
 
 /// Struct representing an active connection to the homeserver.
@@ -518,6 +524,24 @@ impl Connection {
         }
     }
 
+    /// Queue the room's unread state: client-side counts computed from read
+    /// receipts, and the "marked as unread" flag.
+    fn queue_room_unread(
+        channel: Sender<Result<ClientMessage, String>>,
+        room: &Room,
+    ) {
+        let message = ClientMessage::RoomUnread {
+            room_id: room.room_id().to_owned(),
+            unread: room.num_unread_messages(),
+            mentions: room.num_unread_mentions(),
+            marked_unread: room.is_marked_unread(),
+        };
+
+        tokio::spawn(async move {
+            let _ = channel.send(Ok(message)).await;
+        });
+    }
+
     fn queue_room_metadata(
         channel: Sender<Result<ClientMessage, String>>,
         room: Room,
@@ -595,6 +619,17 @@ impl Connection {
                         room_id,
                         is_direct,
                         display_name,
+                    ),
+                    ClientMessage::RoomUnread {
+                        room_id,
+                        unread,
+                        mentions,
+                        marked_unread,
+                    } => server.receive_room_unread(
+                        room_id,
+                        unread,
+                        mentions,
+                        marked_unread,
                     ),
                     ClientMessage::ToDeviceEvent(e) => {
                         server.receive_to_device_event(e).await
@@ -699,6 +734,7 @@ impl Connection {
             }
             for room in client.joined_rooms() {
                 Self::queue_room_metadata(channel.clone(), room.clone());
+                Self::queue_room_unread(channel.clone(), &room);
                 if channel
                     .send(Ok(ClientMessage::RestoredRoom(
                         room.room_id().to_owned(),
@@ -838,6 +874,7 @@ impl Connection {
             if !first_login {
                 for room in client.joined_rooms() {
                     Self::queue_room_metadata(channel.clone(), room.clone());
+                    Self::queue_room_unread(channel.clone(), &room);
                     if channel
                         .send(Ok(ClientMessage::RestoredRoom(
                             room.room_id().to_owned(),
@@ -963,6 +1000,7 @@ impl Connection {
                             sync_channel.clone(),
                             room.clone(),
                         );
+                        Self::queue_room_unread(sync_channel.clone(), &room);
                     }
                     let state_events = match &room.state {
                         State::Before(state) | State::After(state) => state,

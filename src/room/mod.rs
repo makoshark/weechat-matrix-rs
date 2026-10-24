@@ -1452,6 +1452,31 @@ impl MatrixRoom {
             .unwrap_or_default()
     }
 
+    /// Mirror the room's unread state into the WeeChat hotlist, so rooms read
+    /// or marked unread in other clients show up the same way here.
+    pub fn apply_unread(&self, unread: u64, mentions: u64, marked_unread: bool) {
+        let buffer_handle = self.buffer_handle();
+        let Ok(buffer) = buffer_handle.upgrade() else {
+            return;
+        };
+
+        if buffer == unsafe { Weechat::weechat() }.current_buffer() {
+            return;
+        }
+
+        let command = if unread == 0 && !marked_unread {
+            "/hotlist remove"
+        } else if mentions > 0 {
+            "/hotlist add highlight"
+        } else if buffer.get_localvar("type").as_deref() == Some("private") {
+            "/hotlist add private"
+        } else {
+            "/hotlist add message"
+        };
+
+        let _ = buffer.run_command(command);
+    }
+
     pub fn apply_room_metadata(
         &self,
         is_direct: bool,
