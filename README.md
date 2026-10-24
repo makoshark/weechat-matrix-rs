@@ -258,6 +258,17 @@ To complete shortcodes with Tab, add the `matrix_emojis` completion to the
 default template:
 
        /set weechat.completion.default_template "%(nicks)|%(irc_channels)|%(matrix_emojis)"
+# Direct Messages
+
+Whether a room is a direct message is stored in your account data, so it can
+be changed from any client. To mark the current room as a direct message, or
+turn a direct message back into a normal room:
+
+       /matrix direct on
+       /matrix direct off
+
+The buffer name, its type and message notification tags follow the change,
+also when it is made in another client.
 
 # Matrix Spaces
 

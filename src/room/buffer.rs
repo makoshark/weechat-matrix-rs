@@ -685,6 +685,14 @@ impl RoomBuffer {
             .unwrap_or_default()
     }
 
+    /// The display name cached with the room metadata, if any.
+    pub fn cached_display_name(&self) -> Option<String> {
+        self.room_metadata
+            .borrow()
+            .as_ref()
+            .and_then(|(_, name)| name.clone())
+    }
+
     pub fn set_room_metadata(
         &self,
         is_direct: bool,
