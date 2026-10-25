@@ -555,6 +555,87 @@ fn make_emote_message_content(
     content
 }
 
+/// Turn `nick:` at the start of the input and `@nick` anywhere into Markdown
+/// links to the member's matrix.to URL, which clients show as mention pills.
+/// Returns the new input and the mentioned users.
+fn link_mentions(
+    input: &str,
+    members: &[(String, OwnedUserId)],
+) -> (String, Vec<OwnedUserId>) {
+    let mut members: Vec<_> = members
+        .iter()
+        .filter(|(nick, _)| !nick.is_empty())
+        .collect();
+    members.sort_by_key(|(nick, _)| std::cmp::Reverse(nick.len()));
+
+    let match_at = |text: &str| {
+        members.iter().copied().find(|(nick, _)| {
+            text.get(..nick.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(nick))
+                && text[nick.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+        })
+    };
+
+    let mut output = String::with_capacity(input.len());
+    let mut mentioned: Vec<OwnedUserId> = Vec::new();
+    let mut add_link =
+        |output: &mut String, nick: &str, user_id: &OwnedUserId| {
+            output.push_str(&mention_link(nick, user_id));
+            if !mentioned.contains(user_id) {
+                mentioned.push(user_id.clone());
+            }
+        };
+
+    let mut rest = input;
+    if let Some((nick, user_id)) = match_at(rest) {
+        if rest[nick.len()..].starts_with([':', ',']) {
+            add_link(&mut output, nick, user_id);
+            rest = &rest[nick.len()..];
+        }
+    }
+
+    let mut in_code = false;
+    let mut previous = output.chars().last();
+    while let Some(c) = rest.chars().next() {
+        if c == '`' {
+            in_code = !in_code;
+        }
+        if c == '@'
+            && !in_code
+            && previous.is_none_or(|p| p.is_whitespace() || p == '(')
+        {
+            if let Some((nick, user_id)) = match_at(&rest[1..]) {
+                add_link(&mut output, nick, user_id);
+                rest = &rest[1 + nick.len()..];
+                previous = nick.chars().last();
+                continue;
+            }
+        }
+        output.push(c);
+        previous = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+
+    (output, mentioned)
+}
+
+/// A Markdown link to a user, labelled with their display name.
+fn mention_link(nick: &str, user_id: &UserId) -> String {
+    // Ambiguous nicks look like "Name (@user:server)".
+    let name = nick.strip_suffix(&format!(" ({user_id})")).unwrap_or(nick);
+    let mut label = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '\\' | '[' | ']') {
+            label.push('\\');
+        }
+        label.push(c);
+    }
+    format!("[{label}](https://matrix.to/#/{user_id})")
+}
+
 fn with_mentions(
     mut content: RoomMessageEventContent,
     mentioned_user_ids: Vec<OwnedUserId>,
@@ -1047,12 +1128,30 @@ impl MatrixRoom {
             self.latest_thread_event_ids.borrow().get(root).cloned()
         });
 
-        make_text_message_content(
+        let markdown = self.config.borrow().input().markdown_input();
+        let (input, mentioned) = if markdown {
+            link_mentions(&input, &self.members.nicks())
+        } else {
+            (input, Vec::new())
+        };
+        let room_mention = input.contains("@room");
+
+        let content = make_text_message_content(
             input,
-            self.config.borrow().input().markdown_input(),
+            markdown,
             thread_root,
             latest_thread_event,
-        )
+        );
+        if mentioned.is_empty() {
+            return content;
+        }
+
+        let mut content = with_mentions(content, mentioned);
+        // m.mentions turns off the legacy "@room" body rule.
+        if let Some(mentions) = content.mentions.as_mut() {
+            mentions.room = room_mention;
+        }
+        content
     }
 
     fn server(&self) -> Option<MatrixServer> {
@@ -3779,6 +3878,7 @@ fn typing_notice_text(typing_users: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matrix_sdk::ruma::user_id;
 
     fn text_content(body: &str) -> RoomMessageEventContent {
         RoomMessageEventContent::text_plain(body)
@@ -3916,6 +4016,68 @@ mod tests {
         assert_eq!(
             history_page_marker(&HistoryPageResult::Unavailable),
             "matrix_history_page added=0 exhausted=1 state=unavailable"
+        );
+    }
+
+    fn mention_members() -> Vec<(String, OwnedUserId)> {
+        vec![
+            (
+                "mako".to_owned(),
+                user_id!("@makoshark:example.org").to_owned(),
+            ),
+            (
+                "Kaylea Champion".to_owned(),
+                user_id!("@kaylea:example.org").to_owned(),
+            ),
+            (
+                "Jo (@jo:example.org)".to_owned(),
+                user_id!("@jo:example.org").to_owned(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn completed_nicks_become_mention_links() {
+        let (text, mentioned) =
+            link_mentions("mako: see this", &mention_members());
+        assert_eq!(
+            text,
+            "[mako](https://matrix.to/#/@makoshark:example.org): see this"
+        );
+        assert_eq!(
+            mentioned,
+            vec![user_id!("@makoshark:example.org").to_owned()]
+        );
+    }
+
+    #[test]
+    fn at_nicks_become_mention_links() {
+        let (text, mentioned) = link_mentions(
+            "ask @kaylea champion and @Jo (@jo:example.org), not `@mako`",
+            &mention_members(),
+        );
+        assert_eq!(
+            text,
+            "ask [Kaylea Champion](https://matrix.to/#/@kaylea:example.org) \
+             and [Jo](https://matrix.to/#/@jo:example.org), not `@mako`"
+        );
+        assert_eq!(mentioned.len(), 2);
+    }
+
+    #[test]
+    fn non_mentions_are_left_alone() {
+        for input in ["@makoshark hi", "email mako@example.org", "@room hi"] {
+            let (text, mentioned) = link_mentions(input, &mention_members());
+            assert_eq!(text, input);
+            assert!(mentioned.is_empty());
+        }
+    }
+
+    #[test]
+    fn mention_labels_escape_brackets() {
+        assert_eq!(
+            mention_link("a [b]", user_id!("@a:example.org")),
+            "[a \\[b\\]](https://matrix.to/#/@a:example.org)"
         );
     }
 
