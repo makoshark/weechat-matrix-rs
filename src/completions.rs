@@ -25,6 +25,7 @@ pub struct Completions {
     media: CompletionHook,
     nicks: CompletionHook,
     emojis: CompletionHook,
+    mentions: CompletionHook,
 }
 
 impl Completions {
@@ -37,8 +38,9 @@ impl Completions {
             users: UsersCompletion::create(servers.clone())?,
             room_members: RoomMembersCompletion::create()?,
             media: MediaCompletion::create(servers.clone())?,
-            nicks: NicksCompletion::create(servers)?,
+            nicks: NicksCompletion::create(servers.clone())?,
             emojis: EmojisCompletion::create()?,
+            mentions: MentionsCompletion::create(servers)?,
         })
     }
 }
@@ -307,6 +309,48 @@ impl CompletionCallback for NicksCompletion {
             room_names,
         ) {
             completion.add_with_options(&nick, true, CompletionPosition::Sorted)
+        }
+
+        Ok(())
+    }
+}
+
+/// Completes `@nick` with the `@` kept, so the result is sent as a mention.
+struct MentionsCompletion {
+    servers: Servers,
+}
+
+impl MentionsCompletion {
+    fn create(servers: Servers) -> Result<CompletionHook, ()> {
+        CompletionHook::new(
+            "matrix_mentions",
+            "Completion for Matrix room members as @mentions",
+            MentionsCompletion { servers },
+        )
+    }
+}
+
+impl CompletionCallback for MentionsCompletion {
+    fn callback(
+        &mut self,
+        _: &Weechat,
+        buffer: &Buffer,
+        _: Cow<str>,
+        completion: &Completion,
+    ) -> Result<(), ()> {
+        let names = self
+            .servers
+            .find_room(buffer)
+            .map(|room| room.names())
+            .unwrap_or_default();
+
+        for name in names {
+            // Not a nick completion, so line start gets no ":" either.
+            completion.add_with_options(
+                &format!("@{name}"),
+                false,
+                CompletionPosition::Sorted,
+            );
         }
 
         Ok(())
