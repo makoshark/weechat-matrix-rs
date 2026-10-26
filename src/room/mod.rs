@@ -55,7 +55,7 @@ use matrix_sdk::{
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseFileInfo, BaseImageInfo,
     },
-    deserialized_responses::AmbiguityChange,
+    deserialized_responses::{AmbiguityChange, TimelineEvent},
     room::{
         edit::EditedContent,
         reply::{EnforceThread, Reply},
@@ -3106,6 +3106,7 @@ impl MatrixRoom {
                     r.end.clone(),
                     fetched,
                 );
+                let first_page = self.latest_event_id.borrow().is_none();
                 let mut added = 0;
                 for event in
                     r.chunk.iter().filter_map(|e| e.raw().deserialize().ok())
@@ -3123,6 +3124,10 @@ impl MatrixRoom {
                         *self.latest_event_id.borrow_mut() = Some(event_id);
                     }
                     added += self.handle_room_event(&event).await;
+                }
+
+                if first_page {
+                    self.flag_unread_history(&r.chunk).await;
                 }
 
                 let mut prev_batch = self.prev_batch.borrow_mut();
@@ -3151,6 +3156,63 @@ impl MatrixRoom {
         Weechat::bar_item_update("matrix_modes");
 
         result
+    }
+
+    /// Backlog lines carry no notify tags, so count the page's messages newer
+    /// than the user's own read receipt and mirror that into the hotlist.
+    async fn flag_unread_history(&self, chunk: &[TimelineEvent]) {
+        let Some(connection) = self.connection.borrow().as_ref().cloned()
+        else {
+            return;
+        };
+        let receipts = connection
+            .own_read_receipts(self.room(), self.own_user_id.clone())
+            .await;
+        let events: Vec<AnySyncTimelineEvent> = chunk
+            .iter()
+            .filter_map(|event| event.raw().deserialize().ok())
+            .collect();
+
+        let mut read_until = receipts.iter().filter_map(|(_, ts)| *ts).max();
+        for (event_id, _) in &receipts {
+            if let Some(event) =
+                events.iter().find(|event| event.event_id() == event_id)
+            {
+                read_until = read_until.max(Some(event.origin_server_ts()));
+            }
+        }
+
+        let (mut unread, mut mentions) = (0, 0);
+        for event in &events {
+            let AnySyncTimelineEvent::MessageLike(event) = event else {
+                continue;
+            };
+            if read_until.is_some_and(|ts| event.origin_server_ts() <= ts)
+                || event.sender() == &*self.own_user_id
+                || event.is_edit()
+            {
+                continue;
+            }
+            match event.original_content() {
+                Some(AnyMessageLikeEventContent::RoomMessage(content)) => {
+                    unread += 1;
+                    if content.mentions.as_ref().is_some_and(|mentions| {
+                        mentions.user_ids.contains(&self.own_user_id)
+                    }) {
+                        mentions += 1;
+                    }
+                }
+                Some(
+                    AnyMessageLikeEventContent::RoomEncrypted(_)
+                    | AnyMessageLikeEventContent::Sticker(_),
+                ) => unread += 1,
+                _ => (),
+            }
+        }
+
+        if unread > 0 {
+            self.apply_unread(unread, mentions, false);
+        }
     }
 
     pub fn print_history_page_result(&self, result: HistoryPageResult) {

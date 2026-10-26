@@ -48,12 +48,14 @@ use matrix_sdk::{
             uiaa::{AuthData, MatrixUserIdentifier, Password, UserIdentifier},
         },
         events::{
-            room::member::RoomMemberEventContent, AnyMessageLikeEventContent,
-            AnySyncEphemeralRoomEvent, AnySyncStateEvent, AnySyncTimelineEvent,
-            AnyToDeviceEvent, SyncStateEvent,
+            receipt::{ReceiptThread, ReceiptType},
+            room::member::RoomMemberEventContent,
+            AnyMessageLikeEventContent, AnySyncEphemeralRoomEvent,
+            AnySyncStateEvent, AnySyncTimelineEvent, AnyToDeviceEvent,
+            SyncStateEvent,
         },
-        OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedTransactionId,
-        OwnedUserId,
+        MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedRoomId,
+        OwnedTransactionId, OwnedUserId,
     },
     store::RoomLoadSettings,
     sync::State,
@@ -507,6 +509,37 @@ impl Connection {
             room.send_multiple_receipts(receipts).await
         })
         .await
+    }
+
+    /// The user's own read receipts in the room: the event each one points
+    /// at and when it was sent. Public and private, unthreaded and main.
+    pub async fn own_read_receipts(
+        &self,
+        room: Room,
+        user_id: OwnedUserId,
+    ) -> Vec<(OwnedEventId, Option<MilliSecondsSinceUnixEpoch>)> {
+        self.try_spawn(async move {
+            let mut receipts = Vec::new();
+
+            for receipt_type in [ReceiptType::Read, ReceiptType::ReadPrivate] {
+                for thread in [ReceiptThread::Unthreaded, ReceiptThread::Main] {
+                    if let Ok(Some((event_id, receipt))) = room
+                        .load_user_receipt(
+                            receipt_type.clone(),
+                            thread,
+                            &user_id,
+                        )
+                        .await
+                    {
+                        receipts.push((event_id, receipt.ts));
+                    }
+                }
+            }
+
+            receipts
+        })
+        .await
+        .unwrap_or_default()
     }
 
     pub(crate) fn save_device_id(
