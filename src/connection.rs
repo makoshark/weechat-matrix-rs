@@ -8,11 +8,16 @@ use std::{
 
 use tokio::{
     runtime::Runtime,
-    sync::mpsc::{channel, Receiver, Sender},
+    sync::{
+        broadcast::error::RecvError,
+        mpsc::{channel, Receiver, Sender},
+    },
     task::JoinHandle,
 };
 
 use tracing::error;
+
+use matrix_sdk_base::RoomInfoNotableUpdateReasons;
 
 use matrix_sdk::{
     self,
@@ -138,6 +143,12 @@ pub enum ClientMessage {
         is_direct: bool,
         display_name: Option<String>,
     },
+    RoomUnread {
+        room_id: OwnedRoomId,
+        unread: u64,
+        mentions: u64,
+        marked_unread: bool,
+    },
 }
 
 /// Struct representing an active connection to the homeserver.
@@ -153,6 +164,7 @@ pub enum ClientMessage {
 pub struct Connection {
     receiver_task: Rc<RefCell<Option<Task<()>>>>,
     sync_task: Rc<RefCell<Option<JoinHandle<()>>>>,
+    unread_task: Rc<RefCell<Option<JoinHandle<()>>>>,
     client: Option<Client>,
     runtime: Option<Rc<Runtime>>,
 }
@@ -264,12 +276,14 @@ impl Connection {
     }
 
     fn stop_sync_task(&self, runtime: &Runtime) {
-        let Some(task) = self.sync_task.borrow_mut().take() else {
-            return;
-        };
+        for task in [&self.sync_task, &self.unread_task] {
+            let Some(task) = task.borrow_mut().take() else {
+                continue;
+            };
 
-        task.abort();
-        let _ = runtime.block_on(async { task.await });
+            task.abort();
+            let _ = runtime.block_on(async { task.await });
+        }
     }
 
     fn stop_receiver_task(&self, runtime: &Runtime) {
@@ -293,6 +307,18 @@ impl Connection {
 
         let runtime = Runtime::new().unwrap();
 
+        {
+            // The event cache counts unread messages from read receipts; it
+            // has to be listening before the first sync response arrives.
+            let _guard = runtime.enter();
+            if let Err(error) = client.event_cache().subscribe() {
+                error!("Can't enable the event cache: {error}");
+            }
+        }
+
+        let unread_task =
+            runtime.spawn(Connection::unread_loop(client.clone(), tx.clone()));
+
         let sync_task = runtime.spawn(Connection::sync_loop(
             client.clone(),
             tx,
@@ -308,6 +334,7 @@ impl Connection {
         Self {
             receiver_task: Rc::new(RefCell::new(Some(receiver_task))),
             sync_task: Rc::new(RefCell::new(Some(sync_task))),
+            unread_task: Rc::new(RefCell::new(Some(unread_task))),
             client: Some(client.clone()),
             runtime: Some(runtime.into()),
         }
@@ -518,6 +545,61 @@ impl Connection {
         }
     }
 
+    /// The room's unread state: counts the event cache computes from read
+    /// receipts, and the "marked as unread" flag.
+    fn room_unread_message(room: &Room) -> ClientMessage {
+        ClientMessage::RoomUnread {
+            room_id: room.room_id().to_owned(),
+            unread: room.num_unread_messages(),
+            mentions: room.num_unread_mentions(),
+            marked_unread: room.is_marked_unread(),
+        }
+    }
+
+    fn queue_room_unread(
+        channel: Sender<Result<ClientMessage, String>>,
+        room: &Room,
+    ) {
+        let message = Self::room_unread_message(room);
+
+        tokio::spawn(async move {
+            let _ = channel.send(Ok(message)).await;
+        });
+    }
+
+    /// Forward unread changes as the event cache recounts them. A sync
+    /// response arrives before the cache has processed it, so counts can't be
+    /// read from the sync loop.
+    async fn unread_loop(
+        client: Client,
+        channel: Sender<Result<ClientMessage, String>>,
+    ) {
+        let mut updates = client.room_info_notable_update_receiver();
+
+        loop {
+            let rooms = match updates.recv().await {
+                Ok(update) => {
+                    if !update.reasons.intersects(
+                        RoomInfoNotableUpdateReasons::READ_RECEIPT
+                            | RoomInfoNotableUpdateReasons::UNREAD_MARKER,
+                    ) {
+                        continue;
+                    }
+                    client.get_room(&update.room_id).into_iter().collect()
+                }
+                Err(RecvError::Lagged(_)) => client.joined_rooms(),
+                Err(RecvError::Closed) => break,
+            };
+
+            for room in rooms {
+                let message = Self::room_unread_message(&room);
+                if channel.send(Ok(message)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
     fn queue_room_metadata(
         channel: Sender<Result<ClientMessage, String>>,
         room: Room,
@@ -595,6 +677,17 @@ impl Connection {
                         room_id,
                         is_direct,
                         display_name,
+                    ),
+                    ClientMessage::RoomUnread {
+                        room_id,
+                        unread,
+                        mentions,
+                        marked_unread,
+                    } => server.receive_room_unread(
+                        room_id,
+                        unread,
+                        mentions,
+                        marked_unread,
                     ),
                     ClientMessage::ToDeviceEvent(e) => {
                         server.receive_to_device_event(e).await
@@ -699,6 +792,7 @@ impl Connection {
             }
             for room in client.joined_rooms() {
                 Self::queue_room_metadata(channel.clone(), room.clone());
+                Self::queue_room_unread(channel.clone(), &room);
                 if channel
                     .send(Ok(ClientMessage::RestoredRoom(
                         room.room_id().to_owned(),
@@ -838,6 +932,7 @@ impl Connection {
             if !first_login {
                 for room in client.joined_rooms() {
                     Self::queue_room_metadata(channel.clone(), room.clone());
+                    Self::queue_room_unread(channel.clone(), &room);
                     if channel
                         .send(Ok(ClientMessage::RestoredRoom(
                             room.room_id().to_owned(),
@@ -1231,6 +1326,7 @@ mod runtime_boundary_tests {
         let connection = Connection {
             receiver_task: Rc::new(RefCell::new(None)),
             sync_task: Rc::new(RefCell::new(None)),
+            unread_task: Rc::new(RefCell::new(None)),
             client: None,
             runtime: Some(runtime.clone()),
         };
