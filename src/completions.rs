@@ -278,11 +278,12 @@ impl CompletionCallback for MentionsCompletion {
         _: Cow<str>,
         completion: &Completion,
     ) -> Result<(), ()> {
-        let names = self
-            .servers
-            .find_room(buffer)
-            .map(|room| room.names())
-            .unwrap_or_default();
+        let Some(room) = self.servers.find_room(buffer) else {
+            return Ok(());
+        };
+        let mut names = room.names();
+        // Offered like in Element; the room's power levels decide its effect.
+        names.push("room".to_owned());
 
         for name in names {
             // Not a nick completion, so line start gets no ":" either.

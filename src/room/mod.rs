@@ -622,6 +622,16 @@ fn link_mentions(
     (output, mentioned)
 }
 
+/// Whether the input mentions `@room` as a word of its own.
+fn mentions_room(input: &str) -> bool {
+    input.match_indices("@room").any(|(start, found)| {
+        let before = input[..start].chars().last();
+        let after = input[start + found.len()..].chars().next();
+        before.is_none_or(|c| c.is_whitespace() || c == '(')
+            && after.is_none_or(|c| !c.is_alphanumeric() && c != '_')
+    })
+}
+
 /// A Markdown link to a user, labelled with their display name.
 fn mention_link(nick: &str, user_id: &UserId) -> String {
     // Ambiguous nicks look like "Name (@user:server)".
@@ -1134,7 +1144,7 @@ impl MatrixRoom {
         } else {
             (input, Vec::new())
         };
-        let room_mention = input.contains("@room");
+        let room_mention = mentions_room(&input);
 
         let content = make_text_message_content(
             input,
@@ -1142,12 +1152,12 @@ impl MatrixRoom {
             thread_root,
             latest_thread_event,
         );
-        if mentioned.is_empty() {
+        if mentioned.is_empty() && !room_mention {
             return content;
         }
 
         let mut content = with_mentions(content, mentioned);
-        // m.mentions turns off the legacy "@room" body rule.
+        // m.mentions replaces the legacy "@room" body rule.
         if let Some(mentions) = content.mentions.as_mut() {
             mentions.room = room_mention;
         }
@@ -3908,6 +3918,22 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(json["m.mentions"]["user_ids"][0], "@ada:example.org");
+    }
+
+    #[test]
+    fn at_room_becomes_a_room_mention() {
+        for input in ["@room hi", "hey @room", "(@room)", "@room: now"] {
+            assert!(mentions_room(input), "{input}");
+        }
+        for input in ["@rooms", "mako@room", "room", "@roomie", "@room_x"] {
+            assert!(!mentions_room(input), "{input}");
+        }
+
+        let mut content = with_mentions(text_content("@room hi"), Vec::new());
+        content.mentions.as_mut().expect("m.mentions").room = true;
+        let json = serde_json::to_value(content).unwrap();
+        assert_eq!(json["m.mentions"]["room"], true);
+        assert!(json["m.mentions"].get("user_ids").is_none());
     }
 
     #[test]

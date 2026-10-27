@@ -312,8 +312,10 @@ MXID localpart, and `%h` for homeserver.
 With `matrix-rust.input.markdown_input` on, a nick completed at the start of a
 message (`nick: hi`) or written as `@nick` anywhere becomes a mention: other
 clients show a pill and notify that user. Nicks are matched against the room's
-members, ignoring case; text in backticks is left alone. To complete `@kay` to
-`@Kaylea` with Tab, add `%(matrix_mentions)` to the completion template:
+members, ignoring case; text in backticks is left alone. `@room` mentions the
+whole room, as far as the room's power levels allow. To complete `@kay` to
+`@Kaylea` (or `@ro` to `@room`) with Tab, add `%(matrix_mentions)` to the
+completion template:
 
     /set weechat.completion.default_template "%(nicks)|%(irc_channels)|%(matrix_mentions)"
 
