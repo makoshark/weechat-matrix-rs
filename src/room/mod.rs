@@ -103,6 +103,7 @@ use weechat::{
 };
 
 use crate::{
+    commands::EditCommand,
     config::{Config, RedactionStyle},
     connection::Connection,
     render::{Render, RenderedEvent, ReplyContext},
@@ -1027,13 +1028,41 @@ impl BufferInputCallbackAsync for MatrixRoom {
         }
 
         if let Ok(buffer) = buffer.upgrade() {
+            if self.config.borrow().input().sed_edit() {
+                if let Some(arguments) = sed_edit_arguments(&input) {
+                    match EditCommand::parse_arguments(
+                        &buffer,
+                        Some(vec![arguments]),
+                        self.edit_regex(),
+                    ) {
+                        Ok((event_id, message)) => {
+                            self.send_edit(event_id, message).await
+                        }
+                        Err(error) => self.print_error(&error),
+                    }
+                    return;
+                }
+            }
+
             let content = self.text_message_content(&buffer, input);
             self.send_message(content).await;
         }
     }
 }
 
+/// The `/pattern/replacement/` part of an `s/pattern/replacement/` message.
+fn sed_edit_arguments(input: &str) -> Option<&str> {
+    let arguments = input.strip_prefix('s')?;
+    let inner = arguments.strip_prefix('/')?.strip_suffix('/')?;
+    let (pattern, replacement) = inner.split_once('/')?;
+    (!pattern.is_empty() && !replacement.contains('/')).then_some(arguments)
+}
+
 impl MatrixRoom {
+    pub(crate) fn edit_regex(&self) -> bool {
+        self.config.borrow().input().edit_regex()
+    }
+
     pub(crate) fn text_message_content(
         &self,
         buffer: &Buffer,
@@ -3782,6 +3811,16 @@ mod tests {
 
     fn text_content(body: &str) -> RoomMessageEventContent {
         RoomMessageEventContent::text_plain(body)
+    }
+
+    #[test]
+    fn sed_edit_shortcut_needs_the_full_form() {
+        use super::sed_edit_arguments;
+        assert_eq!(Some("/teh/the/"), sed_edit_arguments("s/teh/the/"));
+        assert_eq!(Some("/ mako//"), sed_edit_arguments("s/ mako//"));
+        for input in ["s/teh/the", "s//the/", "s/a/b/c/", "say s/a/b/", "sed"] {
+            assert_eq!(None, sed_edit_arguments(input), "{input}");
+        }
     }
 
     #[test]

@@ -307,6 +307,14 @@ the nicklist, `/names`, and nick completion, set `matrix-rust.look.nick_format`:
 Supported placeholders are `%d` for display name, `%m` for full MXID, `%u` for
 MXID localpart, and `%h` for homeserver.
 
+# Editing
+
+`/edit text` replaces your most recent message. `/edit /old/new/` rewrites
+the most recent message containing `old`; an empty replacement deletes the
+text. A message of the form `s/old/new/` does the same as `/edit /old/new/`
+(`matrix-rust.input.sed_edit`). With `matrix-rust.input.edit_regex` on,
+patterns are regular expressions and replacements may refer to groups as `$1`.
+
 # Helpful Commands
 
 `/help matrix` will print information about the `/matrix` command.

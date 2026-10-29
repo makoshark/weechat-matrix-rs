@@ -1,5 +1,6 @@
 use clap::{App as Argparse, AppSettings as ArgParseSettings, Arg};
 use matrix_sdk::ruma::{EventId, OwnedEventId};
+use regex::Regex;
 use weechat::{
     buffer::Buffer,
     hooks::{Command, CommandCallback, CommandSettings},
@@ -11,8 +12,38 @@ use crate::Servers;
 
 const EVENT_ID_TAG_PREFIX: &str = "matrix_id_";
 
-fn message_matches_pattern(message: &str, pattern: &str) -> bool {
-    message.contains(pattern)
+/// The pattern of a `/pattern/` or `/pattern/replacement/` argument.
+enum Pattern<'a> {
+    Substring(&'a str),
+    Regex(Regex),
+}
+
+impl<'a> Pattern<'a> {
+    fn new(pattern: &'a str, regex: bool) -> Result<Self, String> {
+        if regex {
+            Regex::new(pattern).map(Self::Regex).map_err(|error| {
+                format!("Invalid pattern /{pattern}/: {error}")
+            })
+        } else {
+            Ok(Self::Substring(pattern))
+        }
+    }
+
+    fn is_match(&self, message: &str) -> bool {
+        match self {
+            Self::Substring(pattern) => message.contains(pattern),
+            Self::Regex(regex) => regex.is_match(message),
+        }
+    }
+
+    fn replace_all(&self, message: &str, replacement: &str) -> String {
+        match self {
+            Self::Substring(pattern) => message.replace(pattern, replacement),
+            Self::Regex(regex) => {
+                regex.replace_all(message, replacement).into_owned()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -34,11 +65,13 @@ impl EditCommand {
                 "event-id: The Matrix event ID to edit.
     index: 1-based recent unredacted event index. 1, 0, or -1 select the latest \
            event; 2 or -2 select the event before that.
-  pattern: A case-sensitive substring enclosed in slashes. The most recent \
-           unredacted message containing it is selected.
+  pattern: A case-sensitive substring enclosed in slashes, or a regular \
+           expression with matrix-rust.input.edit_regex on. The most recent \
+           unredacted message matching it is selected.
   message: New plain-text message body. The shorthand /pattern/replacement/ \
            selects the most recent matching message and replaces that text; \
-           an empty replacement deletes it.",
+           an empty replacement deletes it. Typing s/pattern/replacement/ as \
+           a message does the same (matrix-rust.input.sed_edit).",
             );
 
         Command::new(
@@ -126,7 +159,7 @@ impl EditCommand {
 
     fn event_id_matching_pattern(
         buffer: &Buffer,
-        pattern: &str,
+        pattern: &Pattern<'_>,
     ) -> Option<OwnedEventId> {
         Self::event_matching_pattern(buffer, pattern)
             .map(|(event_id, _)| event_id)
@@ -134,14 +167,14 @@ impl EditCommand {
 
     fn event_matching_pattern(
         buffer: &Buffer,
-        pattern: &str,
+        pattern: &Pattern<'_>,
     ) -> Option<(OwnedEventId, String)> {
         buffer.lines().rev().find_map(|line| {
             let tags = line.tags();
             let message = Weechat::remove_color(&line.message());
 
             if tags.iter().any(|tag| tag.as_ref() == "matrix_redacted")
-                || !message_matches_pattern(&message, pattern)
+                || !pattern.is_match(&message)
             {
                 return None;
             }
@@ -153,13 +186,18 @@ impl EditCommand {
         })
     }
 
-    fn apply_pattern_edit(message: &str, edit: &PatternEdit<'_>) -> String {
-        message.replace(edit.pattern, edit.message)
+    fn apply_pattern_edit(
+        message: &str,
+        pattern: &Pattern<'_>,
+        edit: &PatternEdit<'_>,
+    ) -> String {
+        pattern.replace_all(message, edit.message)
     }
 
-    fn parse_arguments(
+    pub(crate) fn parse_arguments(
         buffer: &Buffer,
         arguments: Option<Vec<&str>>,
+        regex: bool,
     ) -> Result<(OwnedEventId, String), String> {
         let Some(arguments) =
             arguments.filter(|arguments| !arguments.is_empty())
@@ -188,18 +226,24 @@ impl EditCommand {
             (event_id, rest.join(" "))
         } else if rest.is_empty() {
             if let Some(pattern_edit) = Self::parse_pattern_edit(first)? {
+                let pattern = Pattern::new(pattern_edit.pattern, regex)?;
                 let (event_id, original_message) =
-                    Self::event_matching_pattern(buffer, pattern_edit.pattern)
-                        .ok_or_else(|| {
+                    Self::event_matching_pattern(buffer, &pattern).ok_or_else(
+                        || {
                             format!(
                                 "No unredacted Matrix event matches /{}/.",
                                 pattern_edit.pattern
                             )
-                        })?;
+                        },
+                    )?;
 
                 (
                     event_id,
-                    Self::apply_pattern_edit(&original_message, &pattern_edit),
+                    Self::apply_pattern_edit(
+                        &original_message,
+                        &pattern,
+                        &pattern_edit,
+                    ),
                 )
             } else if let Some(pattern) = Self::parse_pattern(first)? {
                 return Err(format!(
@@ -215,10 +259,13 @@ impl EditCommand {
                 (event_id, arguments.join(" "))
             }
         } else if let Some(pattern) = Self::parse_pattern(first)? {
-            let event_id = Self::event_id_matching_pattern(buffer, pattern)
-                .ok_or_else(|| {
-                    format!("No unredacted Matrix event matches /{}/.", pattern)
-                })?;
+            let event_id = Self::event_id_matching_pattern(
+                buffer,
+                &Pattern::new(pattern, regex)?,
+            )
+            .ok_or_else(|| {
+                format!("No unredacted Matrix event matches /{}/.", pattern)
+            })?;
 
             (event_id, rest.join(" "))
         } else {
@@ -245,6 +292,12 @@ impl EditCommand {
             .arg(Arg::with_name("arguments").multiple(true))
     }
 
+    fn edit_regex(&self, buffer: &Buffer) -> bool {
+        self.servers
+            .find_room(buffer)
+            .is_some_and(|room| room.edit_regex())
+    }
+
     fn edit(&self, buffer: &Buffer, event_id: OwnedEventId, message: String) {
         if let Some(room) = self.servers.find_room(buffer) {
             Weechat::spawn(
@@ -265,6 +318,7 @@ impl CommandCallback for EditCommand {
             match Self::parse_arguments(
                 buffer,
                 args.values_of("arguments").map(|v| v.collect()),
+                self.edit_regex(buffer),
             ) {
                 Ok((event_id, message)) => self.edit(buffer, event_id, message),
                 Err(error) => buffer.print(&format!(
@@ -279,7 +333,7 @@ impl CommandCallback for EditCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{message_matches_pattern, EditCommand, PatternEdit};
+    use super::{EditCommand, Pattern, PatternEdit};
 
     #[test]
     fn edit_index_accepts_recent_event_forms() {
@@ -341,7 +395,11 @@ mod tests {
         );
         assert_eq!(
             "hi there",
-            EditCommand::apply_pattern_edit("hi mako there", &edit)
+            EditCommand::apply_pattern_edit(
+                "hi mako there",
+                &Pattern::Substring(edit.pattern),
+                &edit
+            )
         );
     }
 
@@ -354,20 +412,41 @@ mod tests {
 
         assert_eq!(
             "the cat ate the kibble",
-            EditCommand::apply_pattern_edit("teh cat ate teh kibble", &edit)
+            EditCommand::apply_pattern_edit(
+                "teh cat ate teh kibble",
+                &Pattern::Substring(edit.pattern),
+                &edit
+            )
         );
     }
 
     #[test]
+    fn regex_patterns_match_and_replace_with_groups() {
+        let edit = PatternEdit {
+            pattern: r"(\w+) cat",
+            message: "$1 dog",
+        };
+        let pattern = Pattern::new(edit.pattern, true).unwrap();
+
+        assert!(pattern.is_match("teh cat ate"));
+        assert!(!pattern.is_match("cat"));
+        assert_eq!(
+            "teh dog ate teh kibble",
+            EditCommand::apply_pattern_edit(
+                "teh cat ate teh kibble",
+                &pattern,
+                &edit
+            )
+        );
+        assert!(Pattern::new("(", true).is_err());
+        assert!(Pattern::new("(", false).unwrap().is_match("a ( b"));
+    }
+
+    #[test]
     fn edit_pattern_matches_message_substrings() {
-        assert!(message_matches_pattern(
-            "Something like /edit /pattern/replacement/",
-            "/edit",
-        ));
-        assert!(!message_matches_pattern(
-            "Something like /reply /pattern/",
-            "/edit",
-        ));
+        let pattern = Pattern::Substring("/edit");
+        assert!(pattern.is_match("Something like /edit /pattern/replacement/"));
+        assert!(!pattern.is_match("Something like /reply /pattern/"));
     }
 
     #[test]
