@@ -37,7 +37,8 @@ impl EditCommand {
   pattern: A case-sensitive substring enclosed in slashes. The most recent \
            unredacted message containing it is selected.
   message: New plain-text message body. The shorthand /pattern/replacement/ \
-           selects the most recent matching message and replaces that text.",
+           selects the most recent matching message and replaces that text; \
+           an empty replacement deletes it.",
             );
 
         Command::new(
@@ -115,8 +116,6 @@ impl EditCommand {
 
         if pattern.is_empty() {
             Err("The edit pattern cannot be empty.".to_owned())
-        } else if replacement.is_empty() {
-            Err("Edit message cannot be empty.".to_owned())
         } else {
             Ok(Some(PatternEdit {
                 pattern,
@@ -321,14 +320,28 @@ mod tests {
     }
 
     #[test]
-    fn edit_pattern_replacement_rejects_empty_parts() {
+    fn edit_pattern_replacement_rejects_empty_pattern() {
         assert_eq!(
             Err("The edit pattern cannot be empty.".to_owned()),
             EditCommand::parse_pattern_edit("//the/")
         );
+    }
+
+    #[test]
+    fn edit_pattern_with_empty_replacement_deletes_text() {
+        let edit = EditCommand::parse_pattern_edit("/ mako//")
+            .unwrap()
+            .expect("pattern edit");
         assert_eq!(
-            Err("Edit message cannot be empty.".to_owned()),
-            EditCommand::parse_pattern_edit("/teh//")
+            PatternEdit {
+                pattern: " mako",
+                message: "",
+            },
+            edit
+        );
+        assert_eq!(
+            "hi there",
+            EditCommand::apply_pattern_edit("hi mako there", &edit)
         );
     }
 
